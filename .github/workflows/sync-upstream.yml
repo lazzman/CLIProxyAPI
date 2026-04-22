@@ -1,0 +1,296 @@
+name: sync-upstream
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  schedule:
+    - cron: '*/10 * * * *' # 每10分钟执行一次
+  workflow_dispatch:
+    inputs:
+      upstream_repo_url:
+        description: 上游仓库 HTTPS URL（可选）
+        required: false
+        type: string
+      target_branch:
+        description: 目标分支（可选）
+        required: false
+        type: string
+      merge_strategy:
+        description: 同步策略（merge_request/direct，可选）
+        required: false
+        default: direct
+        type: choice
+        options:
+          - merge_request
+          - direct
+      sync_branch_prefix:
+        description: 临时分支前缀（可选）
+        required: false
+        type: string
+
+concurrency:
+  group: sync-fork-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync from upstream
+    runs-on: ubuntu-latest
+    outputs:
+      REBASE_STATUS: ${{ steps.sync_step.outputs.REBASE_STATUS }}
+      TEMP_BRANCH: ${{ steps.sync_step.outputs.TEMP_BRANCH }}
+      HAS_UPDATES: ${{ steps.sync_step.outputs.HAS_UPDATES }}
+      COMMIT_LOG: ${{ steps.sync_step.outputs.COMMIT_LOG }}
+      EFFECTIVE_MERGE_STRATEGY: ${{ steps.sync_step.outputs.EFFECTIVE_MERGE_STRATEGY }}
+    env:
+      UPSTREAM_REPO_URL: ${{ vars.SYNC_UPSTREAM_REPO_URL || inputs.upstream_repo_url || 'https://github.com/majorcheng/CLIProxyAPI.git' }}
+      TARGET_BRANCH: ${{ vars.SYNC_TARGET_BRANCH || inputs.target_branch || github.event.repository.default_branch }}
+      MERGE_STRATEGY: ${{ vars.SYNC_MERGE_STRATEGY || inputs.merge_strategy || 'direct' }}
+      SYNC_BRANCH_PREFIX: ${{ vars.SYNC_BRANCH_PREFIX || inputs.sync_branch_prefix || 'sync-upstream-' }}
+      EFFECTIVE_TOKEN: ${{ secrets.PAT_TOKEN != '' && secrets.PAT_TOKEN || github.token }}
+      WECHAT_WORK_WEBHOOK_URL: ${{ secrets.WECHAT_WORK_WEBHOOK_URL }}
+
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.TARGET_BRANCH }}
+          token: ${{ env.EFFECTIVE_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch, rebase and push by strategy
+        id: sync_step
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REBASE_STATUS="skipped"
+          TEMP_BRANCH=""
+          HAS_UPDATES="false"
+          COMMIT_LOG="无新内容"
+          EFFECTIVE_MERGE_STRATEGY="${MERGE_STRATEGY}"
+          SHOULD_FAIL="false"
+
+          echo "目标分支: ${TARGET_BRANCH}"
+          echo "上游仓库: ${UPSTREAM_REPO_URL}"
+          echo "同步策略: ${EFFECTIVE_MERGE_STRATEGY}"
+
+          if git remote | grep -q '^upstream$'; then
+            git remote set-url upstream "${UPSTREAM_REPO_URL}"
+          else
+            git remote add upstream "${UPSTREAM_REPO_URL}"
+          fi
+
+          git fetch origin "${TARGET_BRANCH}" --no-tags --force
+          git fetch upstream "${TARGET_BRANCH}" --no-tags --force
+
+          git checkout "${TARGET_BRANCH}"
+          git reset --hard "origin/${TARGET_BRANCH}"
+
+          MERGE_BASE="$(git merge-base "origin/${TARGET_BRANCH}" "upstream/${TARGET_BRANCH}")"
+          RAW_COMMIT_LOG="$(git log --pretty=format:'%h - %s' "${MERGE_BASE}..upstream/${TARGET_BRANCH}" || true)"
+
+          if [ -n "${RAW_COMMIT_LOG}" ]; then
+            HAS_UPDATES="true"
+            COMMIT_LOG="${RAW_COMMIT_LOG}"
+          fi
+
+          if [ "${HAS_UPDATES}" = "true" ]; then
+            if git rebase "upstream/${TARGET_BRANCH}"; then
+              if [ "${EFFECTIVE_MERGE_STRATEGY}" = "direct" ]; then
+                git push --force-with-lease origin "HEAD:${TARGET_BRANCH}"
+                REBASE_STATUS="success"
+              else
+                TEMP_BRANCH="${SYNC_BRANCH_PREFIX}$(date +%Y%m%d-%H%M%S)-${GITHUB_RUN_ID}"
+                git checkout -b "${TEMP_BRANCH}"
+                git push --force --set-upstream origin "${TEMP_BRANCH}"
+                REBASE_STATUS="success"
+              fi
+            else
+              git rebase --abort || true
+              REBASE_STATUS="failure"
+              SHOULD_FAIL="true"
+            fi
+          else
+            REBASE_STATUS="no_updates"
+          fi
+
+          {
+            echo "REBASE_STATUS=${REBASE_STATUS}"
+            echo "TEMP_BRANCH=${TEMP_BRANCH}"
+            echo "HAS_UPDATES=${HAS_UPDATES}"
+            echo "EFFECTIVE_MERGE_STRATEGY=${EFFECTIVE_MERGE_STRATEGY}"
+            echo "COMMIT_LOG<<EOF"
+            echo "${COMMIT_LOG}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+          if [ "${SHOULD_FAIL}" = "true" ]; then
+            exit 1
+          fi
+
+      - name: WeChat notify (direct success)
+        if: ${{ steps.sync_step.outputs.REBASE_STATUS == 'success' && steps.sync_step.outputs.HAS_UPDATES == 'true' && steps.sync_step.outputs.EFFECTIVE_MERGE_STRATEGY == 'direct' && env.WECHAT_WORK_WEBHOOK_URL != '' }}
+        shell: bash
+        run: |
+          MESSAGE_CONTENT="Fork 同步成功（直接推送）\n仓库：${{ github.repository }}\n分支：${TARGET_BRANCH}\n策略：direct\n\n上游更新内容：\n${{ steps.sync_step.outputs.COMMIT_LOG }}"
+          export MESSAGE_CONTENT
+          PAYLOAD=$(python3 -c "import json,os; print(json.dumps({'msgtype':'text','text':{'content':os.environ['MESSAGE_CONTENT']}}, ensure_ascii=False))")
+          curl -sS -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "${WECHAT_WORK_WEBHOOK_URL}"
+
+      - name: WeChat notify (rebase failure)
+        if: ${{ failure() && env.WECHAT_WORK_WEBHOOK_URL != '' }}
+        shell: bash
+        run: |
+          MESSAGE_CONTENT="Fork 同步失败（rebase 冲突）\n仓库：${{ github.repository }}\n分支：${TARGET_BRANCH}\n策略：${MERGE_STRATEGY}\n请手动处理冲突后重试。"
+          export MESSAGE_CONTENT
+          PAYLOAD=$(python3 -c "import json,os; print(json.dumps({'msgtype':'text','text':{'content':os.environ['MESSAGE_CONTENT']}}, ensure_ascii=False))")
+          curl -sS -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "${WECHAT_WORK_WEBHOOK_URL}"
+
+  create_pull_request:
+    name: Cleanup history and create pull request
+    runs-on: ubuntu-latest
+    needs: sync
+    if: ${{ needs.sync.result == 'success' && needs.sync.outputs.REBASE_STATUS == 'success' && needs.sync.outputs.HAS_UPDATES == 'true' && needs.sync.outputs.EFFECTIVE_MERGE_STRATEGY == 'merge_request' }}
+    env:
+      UPSTREAM_REPO_URL: ${{ vars.SYNC_UPSTREAM_REPO_URL || inputs.upstream_repo_url || 'https://github.com/majorcheng/CLIProxyAPI.git' }}
+      TARGET_BRANCH: ${{ vars.SYNC_TARGET_BRANCH || inputs.target_branch || github.event.repository.default_branch }}
+      SYNC_BRANCH_PREFIX: ${{ vars.SYNC_BRANCH_PREFIX || inputs.sync_branch_prefix || 'sync-upstream-' }}
+      TEMP_BRANCH: ${{ needs.sync.outputs.TEMP_BRANCH }}
+      COMMIT_LOG: ${{ needs.sync.outputs.COMMIT_LOG }}
+      EFFECTIVE_TOKEN: ${{ secrets.PAT_TOKEN != '' && secrets.PAT_TOKEN || github.token }}
+      WECHAT_WORK_WEBHOOK_URL: ${{ secrets.WECHAT_WORK_WEBHOOK_URL }}
+
+    steps:
+      - name: Cleanup old PR/branches and create PR
+        id: pr_step
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.EFFECTIVE_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const targetBranch = process.env.TARGET_BRANCH;
+            const tempBranch = process.env.TEMP_BRANCH;
+            const prefix = process.env.SYNC_BRANCH_PREFIX;
+
+            if (!tempBranch) {
+              core.setFailed('TEMP_BRANCH 为空，无法创建 PR。');
+              return;
+            }
+
+            const cleanupLogs = [];
+
+            const openPrs = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
+              base: targetBranch,
+              per_page: 100
+            });
+
+            for (const pr of openPrs) {
+              const headRef = pr.head?.ref || '';
+              if (!headRef.startsWith(prefix)) continue;
+              if (headRef === tempBranch) continue;
+
+              await github.rest.pulls.update({
+                owner,
+                repo,
+                pull_number: pr.number,
+                state: 'closed'
+              });
+              cleanupLogs.push(`关闭 PR #${pr.number} (${headRef})`);
+            }
+
+            const refs = await github.paginate(github.rest.git.listMatchingRefs, {
+              owner,
+              repo,
+              ref: `heads/${prefix}`
+            });
+
+            for (const item of refs) {
+              const branch = item.ref.replace('refs/heads/', '');
+              if (!branch.startsWith(prefix)) continue;
+              if (branch === tempBranch) continue;
+
+              try {
+                await github.rest.git.deleteRef({
+                  owner,
+                  repo,
+                  ref: `heads/${branch}`
+                });
+                cleanupLogs.push(`删除分支 ${branch}`);
+              } catch (error) {
+                cleanupLogs.push(`删除分支 ${branch} 失败: ${error.message}`);
+              }
+            }
+
+            const existing = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
+              head: `${owner}:${tempBranch}`,
+              base: targetBranch,
+              per_page: 100
+            });
+
+            let prData;
+            if (existing.length > 0) {
+              prData = existing[0];
+            } else {
+              const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+              const body = [
+                '## 自动同步上游更新',
+                '',
+                `- 上游仓库: ${process.env.UPSTREAM_REPO_URL}`,
+                `- 目标分支: ${targetBranch}`,
+                `- 临时分支: ${tempBranch}`,
+                '',
+                '### 更新内容',
+                '```',
+                process.env.COMMIT_LOG || '无更新详情',
+                '```',
+                '',
+                '> 此 PR 由 GitHub Actions 自动创建，请审核后合并。'
+              ].join('\n');
+
+              const created = await github.rest.pulls.create({
+                owner,
+                repo,
+                title: `自动同步上游更新 - ${now}`,
+                head: tempBranch,
+                base: targetBranch,
+                body
+              });
+              prData = created.data;
+            }
+
+            core.setOutput('pr_number', String(prData.number));
+            core.setOutput('pr_url', prData.html_url);
+            core.setOutput('cleanup_summary', cleanupLogs.length ? cleanupLogs.join('; ') : '无历史同步 PR/分支需要清理');
+
+      - name: WeChat notify (merge_request success)
+        if: ${{ success() && env.WECHAT_WORK_WEBHOOK_URL != '' }}
+        shell: bash
+        run: |
+          MESSAGE_CONTENT="Fork 同步完成（已创建 PR）\n仓库：${{ github.repository }}\n目标分支：${TARGET_BRANCH}\n临时分支：${TEMP_BRANCH}\nPR：${{ steps.pr_step.outputs.pr_url }}\n\n清理结果：${{ steps.pr_step.outputs.cleanup_summary }}"
+          export MESSAGE_CONTENT
+          PAYLOAD=$(python3 -c "import json,os; print(json.dumps({'msgtype':'text','text':{'content':os.environ['MESSAGE_CONTENT']}}, ensure_ascii=False))")
+          curl -sS -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "${WECHAT_WORK_WEBHOOK_URL}"
+
+      - name: WeChat notify (merge_request failure)
+        if: ${{ failure() && env.WECHAT_WORK_WEBHOOK_URL != '' }}
+        shell: bash
+        run: |
+          MESSAGE_CONTENT="Fork 同步失败（创建 PR 阶段）\n仓库：${{ github.repository }}\n目标分支：${TARGET_BRANCH}\n临时分支：${TEMP_BRANCH}\n请检查 workflow 日志。"
+          export MESSAGE_CONTENT
+          PAYLOAD=$(python3 -c "import json,os; print(json.dumps({'msgtype':'text','text':{'content':os.environ['MESSAGE_CONTENT']}}, ensure_ascii=False))")
+          curl -sS -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "${WECHAT_WORK_WEBHOOK_URL}"
