@@ -74,6 +74,45 @@ func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {
 	}
 }
 
+func TestCodexUsageLimitErrorsBecomeRetryableRateLimits(t *testing.T) {
+	body := []byte(`{"error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":120}}`)
+	err := newCodexStatusErr(http.StatusBadRequest, body)
+	if got := err.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if retryAfter := err.RetryAfter(); retryAfter == nil || *retryAfter != 120*time.Second {
+		t.Fatalf("retryAfter = %v, want %v", retryAfter, 120*time.Second)
+	}
+
+	for _, candidate := range [][]byte{
+		body,
+		[]byte(`{"type":"usage_limit_reached"}`),
+	} {
+		if !isCodexUsageLimitError(candidate) {
+			t.Fatalf("isCodexUsageLimitError(%s) = false, want true", candidate)
+		}
+	}
+	if isCodexUsageLimitError([]byte(`{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}`)) {
+		t.Fatal("transient rate limit must not be treated as usage limit")
+	}
+
+	for _, event := range [][]byte{
+		[]byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":120}}`),
+		[]byte(`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":120}}}`),
+	} {
+		streamErr, _, ok := codexTerminalStreamErr(event)
+		if !ok {
+			t.Fatalf("codexTerminalStreamErr(%s) was not handled", event)
+		}
+		if got := streamErr.StatusCode(); got != http.StatusTooManyRequests {
+			t.Fatalf("stream status code = %d, want %d", got, http.StatusTooManyRequests)
+		}
+	}
+	if _, _, ok := codexTerminalStreamErr([]byte(`{"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}`)); ok {
+		t.Fatal("transient rate limit terminal event must remain unhandled")
+	}
+}
+
 func TestNewCodexStatusErrClassifiesKnownCodexFailures(t *testing.T) {
 	tests := []struct {
 		name       string

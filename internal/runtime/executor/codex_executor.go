@@ -1001,7 +1001,7 @@ func ensureCodexTurnMetadata(target http.Header, source http.Header) {
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	errCode := statusCode
-	if isCodexModelCapacityError(body) {
+	if isCodexModelCapacityError(body) || isCodexUsageLimitError(body) {
 		errCode = http.StatusTooManyRequests
 	}
 	body = classifyCodexStatusError(errCode, body)
@@ -1119,6 +1119,11 @@ func isCodexModelCapacityError(errorBody []byte) bool {
 		}
 	}
 	return false
+}
+
+func isCodexUsageLimitError(errorBody []byte) bool {
+	return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(errorBody, "error.type").String()), "usage_limit_reached") ||
+		strings.EqualFold(strings.TrimSpace(gjson.GetBytes(errorBody, "type").String()), "usage_limit_reached")
 }
 
 func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time.Duration {

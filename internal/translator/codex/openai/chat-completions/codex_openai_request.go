@@ -37,6 +37,7 @@ type chatMessage struct {
 
 type chatTool struct {
 	Type     string        `json:"type"`
+	Name     string        `json:"name"`
 	Function *chatToolFunc `json:"function"`
 	// everything else kept as raw so we can pass it through untouched
 	Raw json.RawMessage `json:"-"`
@@ -68,6 +69,10 @@ type chatToolCall struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
+	Custom struct {
+		Name  string `json:"name"`
+		Input string `json:"input"`
+	} `json:"custom"`
 }
 
 type chatRespFormat struct {
@@ -93,12 +98,25 @@ type chatContentPart struct {
 }
 
 type chatContentImageURL struct {
-	URL string `json:"url"`
+	URL    string `json:"url"`
+	FileID string `json:"file_id"`
+	Detail string `json:"detail"`
 }
 
 type chatContentFile struct {
 	FileData string `json:"file_data"`
+	FileID   string `json:"file_id"`
+	FileURL  string `json:"file_url"`
 	Filename string `json:"filename"`
+}
+
+type chatToolOutputPart struct {
+	Type     string           `json:"type"`
+	Text     string           `json:"text"`
+	ImageURL json.RawMessage  `json:"image_url"`
+	FileID   string           `json:"file_id"`
+	Detail   string           `json:"detail"`
+	File     *chatContentFile `json:"file"`
 }
 
 // ---------------------------------------------------------------------------
@@ -125,14 +143,50 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	}
 	req.Messages = normalizePseudoToolResultMessages(req.Messages)
 
-	// Build tool-name shortening map from all function tools in the request.
-	var funcNames []string
+	// Build request-local tool metadata and a shared shortening map.
+	toolNames := make([]string, 0, len(req.Tools))
+	seenToolNames := make(map[string]struct{}, len(req.Tools))
+	customToolNames := make(map[string]struct{}, len(req.Tools))
+	functionToolNames := make(map[string]struct{}, len(req.Tools))
 	for _, t := range req.Tools {
-		if t.Type == "function" && t.Function != nil {
-			funcNames = append(funcNames, t.Function.Name)
+		var name string
+		switch t.Type {
+		case "function":
+			if t.Function != nil {
+				name = t.Function.Name
+				functionToolNames[name] = struct{}{}
+			}
+		case "custom":
+			name = t.Name
+			customToolNames[name] = struct{}{}
+		}
+		if name != "" {
+			if _, seen := seenToolNames[name]; !seen {
+				toolNames = append(toolNames, name)
+				seenToolNames[name] = struct{}{}
+			}
 		}
 	}
-	originalToolNameMap := buildShortNameMap(funcNames)
+	for name := range functionToolNames {
+		delete(customToolNames, name)
+	}
+	originalToolNameMap := buildShortNameMap(toolNames)
+
+	resolveToolCall := func(toolCall chatToolCall) (callType, name, input string, valid bool) {
+		switch toolCall.Type {
+		case "custom":
+			return "custom", toolCall.Custom.Name, toolCall.Custom.Input, true
+		case "function":
+			name = toolCall.Function.Name
+			callType = "function"
+			if _, custom := customToolNames[name]; custom {
+				callType = "custom"
+			}
+			return callType, name, toolCall.Function.Arguments, true
+		default:
+			return "", "", "", false
+		}
+	}
 
 	// ------------------------------------------------------------------
 	// Build output map
@@ -160,20 +214,55 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	// Build input array
 	// ------------------------------------------------------------------
 	input := make([]any, 0, len(req.Messages))
+	type pendingToolCall struct {
+		callID       string
+		sourceCallID string
+		callType     string
+		consumed     bool
+	}
+	var pendingToolCalls []pendingToolCall
+	ambiguousToolCallIDs := make(map[string]struct{})
 
-	for _, m := range req.Messages {
+	for messageIndex, m := range req.Messages {
 		role := m.Role
 		switch role {
 		case "tool":
-			// Decode content string
-			contentStr := rawToString(m.Content)
+			toolCallID := m.ToolCallID
+			if _, ambiguous := ambiguousToolCallIDs[toolCallID]; toolCallID != "" && ambiguous {
+				continue
+			}
+
+			pendingIndex := -1
+			for index := range pendingToolCalls {
+				pendingCall := &pendingToolCalls[index]
+				if pendingCall.consumed {
+					continue
+				}
+				if toolCallID == "" || pendingCall.sourceCallID == toolCallID || pendingCall.callID == toolCallID {
+					pendingIndex = index
+					break
+				}
+			}
+			if pendingIndex < 0 {
+				continue
+			}
+
+			pendingCall := &pendingToolCalls[pendingIndex]
+			pendingCall.consumed = true
+			outputType := "function_call_output"
+			if pendingCall.callType == "custom" {
+				outputType = "custom_tool_call_output"
+			}
 			input = append(input, map[string]any{
-				"type":    "function_call_output",
-				"call_id": m.ToolCallID,
-				"output":  contentStr,
+				"type":    outputType,
+				"call_id": pendingCall.callID,
+				"output":  buildToolCallOutput(m.Content),
 			})
 
 		default:
+			pendingToolCalls = nil
+			ambiguousToolCallIDs = make(map[string]struct{})
+
 			displayRole := role
 			if role == "system" {
 				displayRole = "developer"
@@ -194,19 +283,66 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 
 			// Append function_call objects for assistant tool calls
 			if role == "assistant" {
+				callIDCounts := make(map[string]int, len(m.ToolCalls))
+				usedCallIDs := make(map[string]struct{}, len(m.ToolCalls))
 				for _, tc := range m.ToolCalls {
-					if tc.Type == "function" {
-						name := tc.Function.Name
-						if short, ok := originalToolNameMap[name]; ok {
-							name = short
-						} else {
-							name = shortenNameIfNeeded(name)
+					_, _, _, valid := resolveToolCall(tc)
+					if valid && tc.ID != "" {
+						callIDCounts[tc.ID]++
+						usedCallIDs[tc.ID] = struct{}{}
+					}
+				}
+				for callID, count := range callIDCounts {
+					if count > 1 {
+						ambiguousToolCallIDs[callID] = struct{}{}
+					}
+				}
+
+				for toolCallIndex, tc := range m.ToolCalls {
+					callType, name, callInput, valid := resolveToolCall(tc)
+					if !valid {
+						continue
+					}
+					if _, ambiguous := ambiguousToolCallIDs[tc.ID]; tc.ID != "" && ambiguous {
+						continue
+					}
+
+					callID := tc.ID
+					if callID == "" {
+						baseCallID := "call_missing_" + strconv.Itoa(messageIndex) + "_" + strconv.Itoa(toolCallIndex)
+						callID = baseCallID
+						for suffix := 1; ; suffix++ {
+							if _, used := usedCallIDs[callID]; !used {
+								break
+							}
+							callID = baseCallID + "_" + strconv.Itoa(suffix)
 						}
+						usedCallIDs[callID] = struct{}{}
+					}
+					pendingToolCalls = append(pendingToolCalls, pendingToolCall{
+						callID:       callID,
+						sourceCallID: tc.ID,
+						callType:     callType,
+					})
+
+					if short, ok := originalToolNameMap[name]; ok {
+						name = short
+					} else {
+						name = shortenNameIfNeeded(name)
+					}
+					if callType == "custom" {
+						input = append(input, map[string]any{
+							"type":    "custom_tool_call",
+							"call_id": callID,
+							"name":    name,
+							"input":   callInput,
+						})
+					} else {
 						input = append(input, map[string]any{
 							"type":      "function_call",
-							"call_id":   tc.ID,
+							"call_id":   callID,
 							"name":      name,
-							"arguments": tc.Function.Arguments,
+							"arguments": callInput,
 						})
 					}
 				}
@@ -233,6 +369,17 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 				// Built-in tool – pass through raw
 				var v any
 				_ = json.Unmarshal(t.Raw, &v)
+				if t.Type == "custom" {
+					if item, ok := v.(map[string]any); ok {
+						name := t.Name
+						if short, exists := originalToolNameMap[name]; exists {
+							name = short
+						} else {
+							name = shortenNameIfNeeded(name)
+						}
+						item["name"] = name
+					}
+				}
 				tools = append(tools, v)
 				continue
 			}
@@ -276,10 +423,15 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 			var objVal map[string]any
 			if err2 := json.Unmarshal(req.ToolChoice, &objVal); err2 == nil {
 				tcType, _ := objVal["type"].(string)
-				if tcType == "function" {
-					name := ""
-					if fn, ok := objVal["function"].(map[string]any); ok {
-						name, _ = fn["name"].(string)
+				if tcType == "function" || tcType == "custom" {
+					name, _ := objVal["name"].(string)
+					if tcType == "function" {
+						if fn, ok := objVal["function"].(map[string]any); ok {
+							name, _ = fn["name"].(string)
+						}
+						if _, custom := customToolNames[name]; custom {
+							tcType = "custom"
+						}
 					}
 					if name != "" {
 						if short, ok := originalToolNameMap[name]; ok {
@@ -288,7 +440,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 							name = shortenNameIfNeeded(name)
 						}
 					}
-					choice := map[string]any{"type": "function"}
+					choice := map[string]any{"type": tcType}
 					if name != "" {
 						choice["name"] = name
 					}
@@ -444,6 +596,115 @@ func unmarshalStringMessage(raw json.RawMessage) (string, bool) {
 func marshalStringRawMessage(value string) json.RawMessage {
 	raw, _ := json.Marshal(value)
 	return raw
+}
+
+func buildToolCallOutput(raw json.RawMessage) any {
+	var content string
+	if err := json.Unmarshal(raw, &content); err == nil {
+		var parts []json.RawMessage
+		if json.Unmarshal([]byte(content), &parts) == nil && hasToolOutputImagePart(parts) {
+			return buildToolOutputParts(parts)
+		}
+		return content
+	}
+
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) == nil {
+		return buildToolOutputParts(parts)
+	}
+	return rawToString(raw)
+}
+
+func buildToolOutputParts(parts []json.RawMessage) []any {
+	output := make([]any, 0, len(parts))
+	for _, raw := range parts {
+		var part chatToolOutputPart
+		if err := json.Unmarshal(raw, &part); err != nil {
+			output = append(output, toolOutputFallbackPart(raw))
+			continue
+		}
+
+		switch part.Type {
+		case "text", "input_text", "output_text":
+			output = append(output, map[string]any{"type": "input_text", "text": part.Text})
+		case "image_url", "input_image":
+			imageURL, fileID, detail := toolOutputImageFields(part)
+			if imageURL == "" && fileID == "" {
+				output = append(output, toolOutputFallbackPart(raw))
+				continue
+			}
+			item := map[string]any{"type": "input_image"}
+			if imageURL != "" {
+				item["image_url"] = imageURL
+			}
+			if fileID != "" {
+				item["file_id"] = fileID
+			}
+			if detail != "" {
+				item["detail"] = detail
+			}
+			output = append(output, item)
+		case "file":
+			if part.File == nil || (part.File.FileID == "" && part.File.FileData == "" && part.File.FileURL == "") {
+				output = append(output, toolOutputFallbackPart(raw))
+				continue
+			}
+			item := map[string]any{"type": "input_file"}
+			if part.File.FileID != "" {
+				item["file_id"] = part.File.FileID
+			}
+			if part.File.FileData != "" {
+				item["file_data"] = part.File.FileData
+			}
+			if part.File.FileURL != "" {
+				item["file_url"] = part.File.FileURL
+			}
+			if part.File.Filename != "" {
+				item["filename"] = part.File.Filename
+			}
+			output = append(output, item)
+		default:
+			output = append(output, toolOutputFallbackPart(raw))
+		}
+	}
+	return output
+}
+
+func hasToolOutputImagePart(parts []json.RawMessage) bool {
+	for _, raw := range parts {
+		var part chatToolOutputPart
+		if json.Unmarshal(raw, &part) != nil || (part.Type != "image_url" && part.Type != "input_image") {
+			continue
+		}
+		imageURL, fileID, _ := toolOutputImageFields(part)
+		if imageURL != "" || fileID != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func toolOutputImageFields(part chatToolOutputPart) (imageURL, fileID, detail string) {
+	_ = json.Unmarshal(part.ImageURL, &imageURL)
+	var nested chatContentImageURL
+	if json.Unmarshal(part.ImageURL, &nested) == nil {
+		if imageURL == "" {
+			imageURL = nested.URL
+		}
+		fileID = nested.FileID
+		detail = nested.Detail
+	}
+	if part.FileID != "" {
+		fileID = part.FileID
+	}
+	if part.Detail != "" {
+		detail = part.Detail
+	}
+	return imageURL, fileID, detail
+}
+
+func toolOutputFallbackPart(raw json.RawMessage) map[string]any {
+	return map[string]any{"type": "input_text", "text": string(raw)}
 }
 
 func rawToString(raw json.RawMessage) string {

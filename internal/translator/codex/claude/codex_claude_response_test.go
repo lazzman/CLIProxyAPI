@@ -166,16 +166,20 @@ func TestConvertCodexResponseToClaude_StreamThinkingWithoutReasoningItemOmitsSig
 	}
 }
 
-func TestConvertCodexResponseToClaude_StreamThinkingFinalizesPendingBlockBeforeNextSummaryPart(t *testing.T) {
+func TestConvertCodexResponseToClaude_StreamThinkingKeepsOneBlockAcrossSummaryParts(t *testing.T) {
 	ctx := context.Background()
 	originalRequest := []byte(`{"messages":[]}`)
 	var param any
 
 	chunks := [][]byte{
+		[]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_sig_early\"}}"),
 		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
 		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"First part\"}"),
 		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
 		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Second part\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_sig_final\"}}"),
 	}
 
 	var outputs []string
@@ -185,6 +189,8 @@ func TestConvertCodexResponseToClaude_StreamThinkingFinalizesPendingBlockBeforeN
 
 	startCount := 0
 	stopCount := 0
+	signatures := []string{}
+	thinkingText := strings.Builder{}
 	for _, out := range outputs {
 		for _, line := range strings.Split(out, "\n") {
 			if !strings.HasPrefix(line, "data: ") {
@@ -197,14 +203,105 @@ func TestConvertCodexResponseToClaude_StreamThinkingFinalizesPendingBlockBeforeN
 			if data.Get("type").String() == "content_block_stop" {
 				stopCount++
 			}
+			if data.Get("type").String() == "content_block_delta" {
+				switch data.Get("delta.type").String() {
+				case "thinking_delta":
+					thinkingText.WriteString(data.Get("delta.thinking").String())
+				case "signature_delta":
+					signatures = append(signatures, data.Get("delta.signature").String())
+				}
+			}
 		}
 	}
 
-	if startCount != 2 {
-		t.Fatalf("expected 2 thinking block starts, got %d", startCount)
+	if startCount != 1 || stopCount != 1 {
+		t.Fatalf("thinking lifecycle starts/stops = %d/%d, want 1/1", startCount, stopCount)
 	}
-	if stopCount != 1 {
-		t.Fatalf("expected pending thinking block to be finalized before second start, got %d stops", stopCount)
+	if got := thinkingText.String(); got != "First part\n\nSecond part" {
+		t.Fatalf("thinking text = %q, want joined summary parts", got)
+	}
+	if len(signatures) != 1 || signatures[0] != "enc_sig_final" {
+		t.Fatalf("signatures = %q, want final signature only", signatures)
+	}
+}
+
+func TestConvertCodexResponseToClaude_StreamSerializesInterleavedFunctionCalls(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[{"name":"Read","input_schema":{"type":"object"}}]}`)
+	var param any
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_a"},"output_index":1}`),
+		[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_b","name":"Read"},"output_index":2}`),
+		[]byte(`data: {"type":"response.function_call_arguments.delta","delta":"{\"file_path\":\"b\"}","output_index":2}`),
+		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_b","name":"Read","arguments":"{\"file_path\":\"b\"}"},"output_index":2}`),
+		[]byte(`data: {"type":"response.function_call_arguments.delta","delta":"{\"file_path\":\"a\"}","output_index":1}`),
+		[]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1},"output":[{"type":"function_call","call_id":"call_a","name":"Read","arguments":"{\"file_path\":\"a\"}","output_index":1},{"type":"function_call","call_id":"call_b","name":"Read","arguments":"{\"file_path\":\"b\"}","output_index":2}]}}`),
+	}
+
+	var outputs []string
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	type toolBlock struct {
+		id        string
+		name      string
+		arguments string
+	}
+	events := collectClaudeStreamEvents(outputs)
+	blocks := []toolBlock{}
+	openIndex := int64(-1)
+	for _, event := range events {
+		index := event.Get("index").Int()
+		switch event.Get("type").String() {
+		case "content_block_start":
+			if openIndex >= 0 {
+				t.Fatalf("content block %d started while %d remains open; outputs=%q", index, openIndex, outputs)
+			}
+			if event.Get("content_block.type").String() != "tool_use" {
+				continue
+			}
+			openIndex = index
+			blocks = append(blocks, toolBlock{
+				id:   event.Get("content_block.id").String(),
+				name: event.Get("content_block.name").String(),
+			})
+		case "content_block_delta":
+			if event.Get("delta.type").String() != "input_json_delta" {
+				continue
+			}
+			if openIndex != index || len(blocks) == 0 {
+				t.Fatalf("arguments delta targets unopened block %d; outputs=%q", index, outputs)
+			}
+			blocks[len(blocks)-1].arguments += event.Get("delta.partial_json").String()
+		case "content_block_stop":
+			if openIndex != index {
+				t.Fatalf("content block stop targets %d while %d is open; outputs=%q", index, openIndex, outputs)
+			}
+			openIndex = -1
+		case "message_delta":
+			if openIndex >= 0 {
+				t.Fatalf("message_delta emitted while block %d remains open; outputs=%q", openIndex, outputs)
+			}
+			if got := event.Get("delta.stop_reason").String(); got != "tool_use" {
+				t.Fatalf("stop_reason = %q, want tool_use", got)
+			}
+		}
+	}
+
+	if openIndex >= 0 {
+		t.Fatalf("content block %d remains open; outputs=%q", openIndex, outputs)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("tool block count = %d, want 2; blocks=%+v", len(blocks), blocks)
+	}
+	for i, want := range []toolBlock{
+		{id: "call_a", name: "Read", arguments: `{"file_path":"a"}`},
+		{id: "call_b", name: "Read", arguments: `{"file_path":"b"}`},
+	} {
+		if blocks[i] != want {
+			t.Fatalf("tool block %d = %+v, want %+v", i, blocks[i], want)
+		}
 	}
 }
 

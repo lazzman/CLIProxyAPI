@@ -268,6 +268,93 @@ func TestMultipleToolCalls(t *testing.T) {
 	}
 }
 
+func TestMixedCustomToolsCallMatchingAndImageOutput(t *testing.T) {
+	input := []byte(`{
+		"messages": [
+			{"role":"user","content":"Run the tools."},
+			{"role":"assistant","content":null,"tool_calls":[
+				{"id":"call_shared","type":"function","function":{"name":"shared","arguments":"{}"}},
+				{"id":"call_custom","type":"function","function":{"name":"apply_patch","arguments":"patch"}},
+				{"type":"custom","custom":{"name":"capture","input":"screen"}},
+				{"id":"call_duplicate","type":"function","function":{"name":"shared","arguments":"{}"}},
+				{"id":"call_duplicate","type":"custom","custom":{"name":"apply_patch","input":"duplicate"}}
+			]},
+			{"role":"tool","tool_call_id":"call_custom","content":"patched"},
+			{"role":"tool","content":"[{\"type\":\"input_text\",\"text\":\"still text\"}]"},
+			{"role":"tool","content":"[{\"type\":\"input_text\",\"text\":\"captured\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AA==\",\"detail\":\"original\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.com/generated.png\",\"detail\":\"high\"}}]"},
+			{"role":"tool","tool_call_id":"call_duplicate","content":"ambiguous"},
+			{"role":"tool","tool_call_id":"call_orphan","content":"orphan"}
+		],
+		"tools": [
+			{"type":"function","function":{"name":"shared","parameters":{"type":"object"}}},
+			{"type":"custom","name":"shared","description":"Same-name custom tool."},
+			{"type":"custom","name":"apply_patch","description":"Apply a patch."},
+			{"type":"custom","name":"capture","description":"Capture a screen."}
+		],
+		"tool_choice":{"type":"function","function":{"name":"apply_patch"}}
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-5.6-sol", input, true)
+	items := gjson.GetBytes(out, "input").Array()
+	expectedTypes := []string{
+		"message",
+		"function_call",
+		"custom_tool_call",
+		"custom_tool_call",
+		"custom_tool_call_output",
+		"function_call_output",
+		"custom_tool_call_output",
+	}
+	if len(items) != len(expectedTypes) {
+		t.Fatalf("expected %d input items, got %d: %s", len(expectedTypes), len(items), gjson.GetBytes(out, "input").Raw)
+	}
+	for i, expectedType := range expectedTypes {
+		if got := items[i].Get("type").String(); got != expectedType {
+			t.Fatalf("item %d: expected type %s, got %s: %s", i, expectedType, got, items[i].Raw)
+		}
+	}
+
+	if got := items[1].Get("name").String(); got != "shared" {
+		t.Fatalf("same-name declaration should default to function, got %s", items[1].Raw)
+	}
+	if got := items[2].Get("name").String(); got != "apply_patch" {
+		t.Fatalf("expected inferred custom call, got %s", items[2].Raw)
+	}
+	if got := items[4].Get("call_id").String(); got != "call_custom" {
+		t.Fatalf("expected explicit custom output match, got %s", items[4].Raw)
+	}
+	if got := items[5].Get("call_id").String(); got != "call_shared" {
+		t.Fatalf("expected empty-ID output to use the first pending call, got %s", items[5].Raw)
+	}
+	if output := items[5].Get("output"); output.Type != gjson.String || output.String() != `[{"type":"input_text","text":"still text"}]` {
+		t.Fatalf("expected text-only JSON output to remain a string, got %s", output.Raw)
+	}
+	synthesizedCallID := items[3].Get("call_id").String()
+	if synthesizedCallID == "" || items[6].Get("call_id").String() != synthesizedCallID {
+		t.Fatalf("expected synthesized custom call_id to match its output: %s", gjson.GetBytes(out, "input").Raw)
+	}
+
+	outputParts := items[6].Get("output").Array()
+	if len(outputParts) != 3 || outputParts[0].Get("type").String() != "input_text" {
+		t.Fatalf("expected structured text and image output, got %s", items[6].Get("output").Raw)
+	}
+	if got := outputParts[1].Get("image_url").String(); got != "data:image/png;base64,AA==" {
+		t.Fatalf("expected input_image URL, got %s", outputParts[1].Raw)
+	}
+	if got := outputParts[1].Get("detail").String(); got != "original" {
+		t.Fatalf("expected input_image detail, got %s", outputParts[1].Raw)
+	}
+	if got := outputParts[2].Get("image_url").String(); got != "https://example.com/generated.png" {
+		t.Fatalf("expected image_url URL, got %s", outputParts[2].Raw)
+	}
+	if got := outputParts[2].Get("detail").String(); got != "high" {
+		t.Fatalf("expected image_url detail, got %s", outputParts[2].Raw)
+	}
+	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "custom" {
+		t.Fatalf("expected custom tool choice, got %s", gjson.GetBytes(out, "tool_choice").Raw)
+	}
+}
+
 func TestCodexChatReasoningCompatAcceptsStringReasoning(t *testing.T) {
 	input := []byte(`{
 		"model": "gpt-5.2",

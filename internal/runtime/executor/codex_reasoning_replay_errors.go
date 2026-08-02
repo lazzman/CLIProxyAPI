@@ -92,7 +92,7 @@ func codexTerminalStreamErr(eventData []byte) (statusErr, []byte, bool) {
 }
 
 func codexTerminalStreamErrShouldHandle(body []byte) bool {
-	if codexTerminalErrorIsContextLength(body) {
+	if codexTerminalErrorIsContextLength(body) || isCodexUsageLimitError(body) {
 		return true
 	}
 	code, _, ok := codexStatusErrorClassification(http.StatusBadRequest, body)
